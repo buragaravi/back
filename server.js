@@ -59,6 +59,3 @@ app.listen(PORT, () =>
   console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`)
 );
 
-
-// Expiry check (can be scheduled later using cron)
-checkForExpiringChemicals();
