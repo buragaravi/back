@@ -48,8 +48,7 @@ app.use('/api/invoices', invoiceRoutes);
 app.use('/api/vouchers', voucherRoutes);
 app.use('/api/indents', require('./routes/indentRoutes'));
 
-// Expiry check (can be scheduled later using cron)
-checkForExpiringChemicals();
+
 
 // Global error handler (should be after routes)
 app.use(errorHandler);
@@ -59,3 +58,7 @@ const PORT = process.env.PORT || 7000;
 app.listen(PORT, () =>
   console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`)
 );
+
+
+// Expiry check (can be scheduled later using cron)
+checkForExpiringChemicals();
