@@ -3,6 +3,7 @@ const ChemicalMaster = require('../models/ChemicalMaster');
 const ChemicalLive = require('../models/ChemicalLive');
 const Transaction = require('../models/Transaction');
 const ExpiredChemicalLog = require('../models/ExpiredChemicalLog');
+// const OutOfStockChemical = require('../models/OutOfStockChemical');
 const { default: mongoose } = require('mongoose');
 
 // Constants
@@ -26,6 +27,73 @@ async function getLastUsedBatchId() {
     .sort({ createdAt: -1 })
     .select('batchId');
   return latest?.batchId || null;
+}
+
+// Helper: Move chemical to out-of-stock
+async function moveToOutOfStock(chemicalLiveDoc) {
+  await OutOfStockChemical.findOneAndUpdate(
+    { displayName: chemicalLiveDoc.displayName },
+    {
+      displayName: chemicalLiveDoc.displayName,
+      unit: chemicalLiveDoc.unit,
+      lastOutOfStock: new Date(),
+    },
+    { upsert: true }
+  );
+  await chemicalLiveDoc.deleteOne();
+}
+
+// Helper: Remove from out-of-stock if restocked
+async function removeFromOutOfStock(displayName) {
+  await OutOfStockChemical.deleteOne({ displayName });
+}
+
+// Helper: Re-index chemical names after a batch is deleted
+async function reindexChemicalNames(displayName) {
+  const batches = await ChemicalLive.find({
+    displayName,
+    labId: 'central-lab',
+    quantity: { $gt: 0 },
+  }).sort({ expiryDate: 1 });
+  if (batches.length === 0) return;
+  // First batch gets base name, others get suffixes
+  for (let i = 0; i < batches.length; i++) {
+    let newName = displayName;
+    if (i > 0) newName = `${displayName} - ${String.fromCharCode(65 + i - 1)}`;
+    // Update both chemicalName and displayName for consistency
+    batches[i].chemicalName = newName;
+    await batches[i].save();
+    // Also update master if needed
+    await ChemicalMaster.updateOne(
+      { _id: batches[i].chemicalMasterId },
+      { chemicalName: newName }
+    );
+  }
+}
+
+// Patch: After allocation, handle out-of-stock and reindexing
+async function handlePostAllocation(chemicalLiveDoc) {
+  if (chemicalLiveDoc.quantity > 0) return;
+  // Check for other batches with same displayName
+  const others = await ChemicalLive.find({
+    displayName: chemicalLiveDoc.displayName,
+    labId: 'central-lab',
+    _id: { $ne: chemicalLiveDoc._id },
+    quantity: { $gt: 0 },
+  });
+  if (others.length > 0) {
+    // Delete this batch and reindex
+    await chemicalLiveDoc.deleteOne();
+    await reindexChemicalNames(chemicalLiveDoc.displayName);
+  } else {
+    // Move to out-of-stock
+    await moveToOutOfStock(chemicalLiveDoc);
+  }
+}
+
+// Patch: After adding to central, remove from out-of-stock if present
+async function handleRestock(displayName) {
+  await removeFromOutOfStock(displayName);
 }
 
 // Main controller
@@ -237,7 +305,6 @@ exports.allocateChemicalsToLab = asyncHandler(async (req, res) => {
 
     for (const alloc of allocations) {
       const { chemicalName, quantity } = alloc;
-      
       if (!chemicalName || typeof quantity !== 'number' || quantity <= 0) {
         results.push({ 
           chemicalName, 
@@ -248,22 +315,15 @@ exports.allocateChemicalsToLab = asyncHandler(async (req, res) => {
         continue;
       }
 
-      // Find central stock with locking for ACID compliance
-      const centralStock = await ChemicalLive.findOneAndUpdate(
-        {
-          displayName: chemicalName,
-          labId: 'central-lab',
-          quantity: { $gte: quantity }
-        },
-        { $inc: { quantity: -quantity } },
-        { 
-          session,
-          new: true,
-          sort: { expiryDate: 1 }
-        }
-      );
+      // Find all central stocks for this displayName, sorted by earliest expiry (FIFO)
+      let remainingQty = quantity;
+      const centralStocks = await ChemicalLive.find({
+        displayName: chemicalName,
+        labId: 'central-lab',
+        quantity: { $gt: 0 }
+      }).sort({ expiryDate: 1 }).session(session);
 
-      if (!centralStock) {
+      if (!centralStocks.length) {
         results.push({ 
           chemicalName, 
           status: 'failed', 
@@ -273,7 +333,29 @@ exports.allocateChemicalsToLab = asyncHandler(async (req, res) => {
         continue;
       }
 
-      try {
+      let totalAllocated = 0;
+      let lastExpiry = null;
+      let lastCentralStock = null;
+      let allocationFailed = false;
+
+      for (const centralStock of centralStocks) {
+        if (remainingQty <= 0) break;
+        const allocQty = Math.min(centralStock.quantity, remainingQty);
+        // Decrement central stock
+        const updatedCentral = await ChemicalLive.findOneAndUpdate(
+          {
+            _id: centralStock._id,
+            quantity: { $gte: allocQty }
+          },
+          { $inc: { quantity: -allocQty } },
+          { session, new: true }
+        );
+        if (!updatedCentral) {
+          allocationFailed = true;
+          break;
+        }
+        // PATCH: handle out-of-stock and reindexing
+        await handlePostAllocation(updatedCentral);
         // Add/update lab stock with session
         const labStock = await ChemicalLive.findOneAndUpdate(
           {
@@ -281,13 +363,13 @@ exports.allocateChemicalsToLab = asyncHandler(async (req, res) => {
             labId
           },
           {
-            $inc: { quantity: quantity },
+            $inc: { quantity: allocQty },
             $setOnInsert: {
               chemicalName: centralStock.chemicalName,
               displayName: centralStock.displayName,
               unit: centralStock.unit,
               expiryDate: centralStock.expiryDate,
-              originalQuantity: quantity,
+              originalQuantity: allocQty,
               isAllocated: true
             }
           },
@@ -297,7 +379,6 @@ exports.allocateChemicalsToLab = asyncHandler(async (req, res) => {
             upsert: true
           }
         );
-
         // Create transaction record with session
         await Transaction.create([{
           chemicalName: centralStock.chemicalName,
@@ -305,27 +386,36 @@ exports.allocateChemicalsToLab = asyncHandler(async (req, res) => {
           chemicalLiveId: labStock._id,
           fromLabId: 'central-lab',
           toLabId: labId,
-          quantity,
+          quantity: allocQty,
           unit: centralStock.unit,
           createdBy: req.userId,
           timestamp: new Date()
         }], { session });
+        totalAllocated += allocQty;
+        lastExpiry = centralStock.expiryDate;
+        lastCentralStock = centralStock;
+        remainingQty -= allocQty;
+      }
 
-        results.push({
-          chemicalName,
-          status: 'success',
-          allocatedQuantity: quantity,
-          expiryDate: centralStock.expiryDate
-        });
-      } catch (error) {
-        console.error('Error in allocation:', error);
+      if (allocationFailed || totalAllocated < quantity) {
+        hasError = true;
         results.push({
           chemicalName,
           status: 'failed',
-          reason: 'Database operation failed'
+          reason: 'Insufficient stock or concurrency error',
+          allocatedQuantity: totalAllocated
         });
-        hasError = true;
+        // Optionally: rollback partial allocations for this chemical (advanced)
+        continue;
       }
+
+      results.push({
+        chemicalName,
+        status: 'success',
+        allocatedQuantity: totalAllocated,
+        expiryDate: lastExpiry,
+        chemicalMasterId: lastCentralStock ? lastCentralStock.chemicalMasterId : undefined
+      });
     }
 
     if (hasError) {
@@ -496,10 +586,11 @@ exports.getChemicalDistribution = asyncHandler(async (req, res) => {
 exports.getCentralLiveSimplified = asyncHandler(async (req, res) => {
   try {
     const stock = await ChemicalLive.find({ labId: 'central-lab' })
-      .select('displayName quantity unit expiryDate chemicalMasterId ')
+      .select('_id displayName quantity unit expiryDate chemicalMasterId ')
       .populate('chemicalMasterId', 'pricePerUnit'); // Get only pricePerUnit from master
 
     const simplified = stock.map(item => ({
+      _id: item._id,
       chemicalMasterId: item.chemicalMasterId,
       chemicalName: item.displayName, // Frontend sees clean name
       quantity: item.quantity,
@@ -537,7 +628,7 @@ exports.processExpiredChemicalAction = asyncHandler(async (req, res) => {
   if (!chem) return res.status(404).json({ message: 'ChemicalLive not found' });
 
   if (action === 'merge') {
-    // Merge quantity to another chemical
+    if (!mergeToId) return res.status(400).json({ message: 'Invalid merge target ID' });
     const mergeTo = await ChemicalLive.findById(mergeToId);
     if (!mergeTo) return res.status(404).json({ message: 'Target chemical not found' });
     mergeTo.quantity += chem.quantity;
@@ -582,3 +673,9 @@ exports.processExpiredChemicalAction = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Invalid action' });
   }
 });
+
+// Endpoint: Get all out-of-stock chemicals
+// exports.getOutOfStockChemicals = asyncHandler(async (req, res) => {
+//   const outOfStock = await OutOfStockChemical.find().sort({ lastOutOfStock: -1 });
+//   res.status(200).json(outOfStock);
+// });
