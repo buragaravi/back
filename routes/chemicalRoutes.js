@@ -106,4 +106,13 @@ router.post(
   chemicalController.processExpiredChemicalAction
 );
 
+// =====================
+// 🚨 Out-of-Stock Chemicals
+// =====================
+router.get(
+  '/out-of-stock',
+  authorizeRole(['admin', 'central_lab_admin', 'lab_assistant']),
+  chemicalController.getOutOfStockChemicals
+);
+
 module.exports = router;
