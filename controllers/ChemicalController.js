@@ -3,7 +3,7 @@ const ChemicalMaster = require('../models/ChemicalMaster');
 const ChemicalLive = require('../models/ChemicalLive');
 const Transaction = require('../models/Transaction');
 const ExpiredChemicalLog = require('../models/ExpiredChemicalLog');
-// const OutOfStockChemical = require('../models/OutOfStockChemical');
+const OutOfStockChemical = require('../models/OutOfStockChemical');
 const { default: mongoose } = require('mongoose');
 
 // Constants
@@ -675,7 +675,7 @@ exports.processExpiredChemicalAction = asyncHandler(async (req, res) => {
 });
 
 // Endpoint: Get all out-of-stock chemicals
-// exports.getOutOfStockChemicals = asyncHandler(async (req, res) => {
-//   const outOfStock = await OutOfStockChemical.find().sort({ lastOutOfStock: -1 });
-//   res.status(200).json(outOfStock);
-// });
+exports.getOutOfStockChemicals = asyncHandler(async (req, res) => {
+  const outOfStock = await OutOfStockChemical.find().sort({ lastOutOfStock: -1 });
+  res.status(200).json(outOfStock);
+});
